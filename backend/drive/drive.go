@@ -14,7 +14,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math/rand"
 	"mime"
 	"net/http"
@@ -279,20 +278,23 @@ Leave blank normally.
 Fill in to access "Computers" folders (see docs), or for rclone to use
 a non root folder as its starting point.
 `,
-			Advanced: true,
+			Advanced:  true,
+			Sensitive: true,
 		}, {
 			Name: "service_account_file",
 			Help: "Service Account Credentials JSON file path.\n\nLeave blank normally.\nNeeded only if you want use SA instead of interactive login." + env.ShellExpandHelp,
 		}, {
-			Name:     "service_account_credentials",
-			Help:     "Service Account Credentials JSON blob.\n\nLeave blank normally.\nNeeded only if you want use SA instead of interactive login.",
-			Hide:     fs.OptionHideConfigurator,
-			Advanced: true,
+			Name:      "service_account_credentials",
+			Help:      "Service Account Credentials JSON blob.\n\nLeave blank normally.\nNeeded only if you want use SA instead of interactive login.",
+			Hide:      fs.OptionHideConfigurator,
+			Advanced:  true,
+			Sensitive: true,
 		}, {
-			Name:     "team_drive",
-			Help:     "ID of the Shared Drive (Team Drive).",
-			Hide:     fs.OptionHideConfigurator,
-			Advanced: true,
+			Name:      "team_drive",
+			Help:      "ID of the Shared Drive (Team Drive).",
+			Hide:      fs.OptionHideConfigurator,
+			Advanced:  true,
+			Sensitive: true,
 		}, {
 			Name:     "auth_owner_only",
 			Default:  false,
@@ -418,10 +420,11 @@ date is used.`,
 			Help:     "Size of listing chunk 100-1000, 0 to disable.",
 			Advanced: true,
 		}, {
-			Name:     "impersonate",
-			Default:  "",
-			Help:     `Impersonate this user when using a service account.`,
-			Advanced: true,
+			Name:      "impersonate",
+			Default:   "",
+			Help:      `Impersonate this user when using a service account.`,
+			Advanced:  true,
+			Sensitive: true,
 		}, {
 			Name:    "alternate_export",
 			Default: false,
@@ -453,7 +456,11 @@ If downloading a file returns the error "This file has been identified
 as malware or spam and cannot be downloaded" with the error code
 "cannotDownloadAbusiveFile" then supply this flag to rclone to
 indicate you acknowledge the risks of downloading the file and rclone
-will download it anyway.`,
+will download it anyway.
+
+Note that if you are using service account it will need Manager
+permission (not Content Manager) to for this flag to work. If the SA
+does not have the right permission, Google will just ignore the flag.`,
 			Advanced: true,
 		}, {
 			Name:     "keep_revision_forever",
@@ -588,9 +595,32 @@ This resource key requirement only applies to a subset of old files.
 
 Note also that opening the folder once in the web interface (with the
 user you've authenticated rclone with) seems to be enough so that the
-resource key is no needed.
+resource key is not needed.
+`,
+			Advanced:  true,
+			Sensitive: true,
+		}, {
+			Name: "fast_list_bug_fix",
+			Help: `Work around a bug in Google Drive listing.
+
+Normally rclone will work around a bug in Google Drive when using
+--fast-list (ListR) where the search "(A in parents) or (B in
+parents)" returns nothing sometimes. See #3114, #4289 and
+https://issuetracker.google.com/issues/149522397
+
+Rclone detects this by finding no items in more than one directory
+when listing and retries them as lists of individual directories.
+
+This means that if you have a lot of empty directories rclone will end
+up listing them all individually and this can take many more API
+calls.
+
+This flag allows the work-around to be disabled. This is **not**
+recommended in normal use - only if you have a particular case you are
+having trouble with like many empty directories.
 `,
 			Advanced: true,
+			Default:  true,
 		}, {
 			Name:     config.ConfigEncoding,
 			Help:     config.ConfigEncodingHelp,
@@ -615,6 +645,14 @@ resource key is no needed.
 			{
 				Name: "service_account_file_path",
 				Help: "Service Account Credentials JSON file path .\n",
+			}, {
+				Name: "account_file_path",
+				Help: "Account Credentials Config file path .\n",
+			}, {
+				Name:     "rolling_count",
+				Help:     "Service Account Change Max Account .\n",
+				Advanced: true,
+				Default:  10,
 			}, {
 				Name:     "skip_depth",
 				Help:     `skip depth.`,
@@ -675,10 +713,12 @@ type Options struct {
 	SkipShortcuts             bool                 `config:"skip_shortcuts"`
 	SkipDanglingShortcuts     bool                 `config:"skip_dangling_shortcuts"`
 	ResourceKey               string               `config:"resource_key"`
+	FastListBugFix            bool                 `config:"fast_list_bug_fix"`
 	Enc                       encoder.MultiEncoder `config:"encoding"`
 	EnvAuth                   bool                 `config:"env_auth"`
 	//---- modify
 	ServiceAccountFilePath string `config:"service_account_file_path"`
+	DriveRollingCount      int    `config:"rolling_count"`
 	SkipDepth              int    `config:"skip_depth"`
 	MaybeIsFile            bool   `config:"-"`
 }
@@ -711,6 +751,7 @@ type Fs struct {
 	waitChangeSvc       sync.Mutex
 	FileObj             *fs.Object
 	clients             map[string]http.Client
+	retryCount          int
 }
 
 type baseObject struct {
@@ -800,11 +841,15 @@ func (f *Fs) shouldRetry(ctx context.Context, err error) (bool, error) {
 			fs.Errorf(f, "Received error reason: %s, sa: %s", reason, f.opt.ServiceAccountFile)
 
 			if reason == "rateLimitExceeded" || reason == "userRateLimitExceeded" {
-				//---- 如果存在 ServiceAccountFilePath,调用 changeSvc, 重试
 				if f.opt.ServiceAccountFilePath != "" {
 					f.waitChangeSvc.Lock()
+					f.retryCount++
 					f.changeSvc(ctx, true)
 					f.waitChangeSvc.Unlock()
+					if f.retryCount > f.opt.DriveRollingCount {
+						f.retryCount = 0
+						return false, err
+					}
 					return true, err
 				}
 				//----
@@ -838,7 +883,7 @@ func (f *Fs) changeSvc(ctx context.Context, deleted bool) error {
 		f.ServiceAccountFiles = make(map[string]struct{})
 		f.clients = make(map[string]http.Client)
 
-		dir_list, err := ioutil.ReadDir(opt.ServiceAccountFilePath)
+		dir_list, err := os.ReadDir(opt.ServiceAccountFilePath)
 		if err != nil {
 			fs.Errorf(nil, "read ServiceAccountFilePath: %s Files error", opt.ServiceAccountFilePath)
 			return err
@@ -2056,7 +2101,7 @@ func (f *Fs) listRRunner(ctx context.Context, wg *sync.WaitGroup, in chan listRE
 		// drive where (A in parents) or (B in parents) returns nothing
 		// sometimes. See #3114, #4289 and
 		// https://issuetracker.google.com/issues/149522397
-		if len(dirs) > 1 && !foundItems {
+		if f.opt.FastListBugFix && len(dirs) > 1 && !foundItems {
 			if atomic.SwapInt32(&f.grouping, 1) != 1 {
 				fs.Debugf(f, "Disabling ListR to work around bug in drive as multi listing (%d) returned no entries", len(dirs))
 			}
@@ -3273,6 +3318,46 @@ func (f *Fs) changeServiceAccountFile(ctx context.Context, file string) (err err
 	return nil
 }
 
+func (f *Fs) changeAccountFile(ctx context.Context, file string) (err error) {
+	fs.Debugf(nil, "Changing Account Token File from %s to %s", f.opt.ServiceAccountFile, file)
+	if file == f.opt.ServiceAccountFile {
+		return nil
+	}
+	oldSvc := f.svc
+	oldv2Svc := f.v2Svc
+	oldOAuthClient := f.client
+	oldFile := f.opt.ServiceAccountFile
+	oldCredentials := f.opt.ServiceAccountCredentials
+	defer func() {
+		// Undo all the changes instead of doing selective undo's
+		if err != nil {
+			f.svc = oldSvc
+			f.v2Svc = oldv2Svc
+			f.client = oldOAuthClient
+			f.opt.ServiceAccountFile = oldFile
+			f.opt.ServiceAccountCredentials = oldCredentials
+		}
+	}()
+	f.opt.ServiceAccountFile = file
+	f.opt.ServiceAccountCredentials = ""
+	oAuthClient, err := createOAuthClient(ctx, &f.opt, f.name, f.m)
+	if err != nil {
+		return fmt.Errorf("drive: failed when making oauth client: %w", err)
+	}
+	f.client = oAuthClient
+	f.svc, err = drive.NewService(context.Background(), option.WithHTTPClient(f.client))
+	if err != nil {
+		return fmt.Errorf("couldn't create Drive client: %w", err)
+	}
+	if f.opt.V2DownloadMinSize >= 0 {
+		f.v2Svc, err = drive_v2.NewService(context.Background(), option.WithHTTPClient(f.client))
+		if err != nil {
+			return fmt.Errorf("couldn't create Drive v2 client: %w", err)
+		}
+	}
+	return nil
+}
+
 // Create a shortcut from (f, srcPath) to (dstFs, dstPath)
 //
 // Will not overwrite existing files
@@ -3586,9 +3671,9 @@ This takes an optional directory to trash which make this easier to
 use via the API.
 
     rclone backend untrash drive:directory
-    rclone backend -i untrash drive:directory subdir
+    rclone backend --interactive untrash drive:directory subdir
 
-Use the -i flag to see what would be restored before restoring it.
+Use the --interactive/-i or --dry-run flag to see what would be restored before restoring it.
 
 Result:
 
