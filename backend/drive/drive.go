@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -646,8 +647,9 @@ having trouble with like many empty directories.
 				Name: "service_account_file_path",
 				Help: "Service Account Credentials JSON file path .\n",
 			}, {
-				Name: "account_file_path",
-				Help: "Account Credentials Config file path .\n",
+				Name:    "use_account",
+				Help:    "Use Account .\n",
+				Default: false,
 			}, {
 				Name:     "rolling_count",
 				Help:     "Service Account Change Max Account .\n",
@@ -720,6 +722,7 @@ type Options struct {
 	ServiceAccountFilePath string `config:"service_account_file_path"`
 	DriveRollingCount      int    `config:"rolling_count"`
 	SkipDepth              int    `config:"skip_depth"`
+	UseAccount             bool   `config:"use_account"`
 	MaybeIsFile            bool   `config:"-"`
 }
 
@@ -933,20 +936,22 @@ func (f *Fs) changeSvc(ctx context.Context, deleted bool) error {
 		f.clients[opt.ServiceAccountFile] = *f.client
 	} else {
 		fs.Debugf(nil, "hit gclone sa client cache: %s", opt.ServiceAccountFile)
-		f.opt.ServiceAccountFile = opt.ServiceAccountFile
-
 		f.client = &client
-		svc, err := drive.New(f.client)
-		if err != nil {
-			return fmt.Errorf("couldn't create Drive client: %s", err)
-		}
-		f.svc = svc
-		if f.opt.V2DownloadMinSize >= 0 {
-			v2Svc, err := drive_v2.New(f.client)
+		if !f.opt.UseAccount {
+			f.opt.ServiceAccountFile = opt.ServiceAccountFile
+
+			svc, err := drive.NewService(context.Background(), option.WithHTTPClient(f.client))
 			if err != nil {
-				return fmt.Errorf("couldn't create Drive v2 client: %s", err)
+				return fmt.Errorf("couldn't create Drive client: %s", err)
 			}
-			f.v2Svc = v2Svc
+			f.svc = svc
+			if f.opt.V2DownloadMinSize >= 0 {
+				v2Svc, err := drive_v2.NewService(context.Background(), option.WithHTTPClient(f.client))
+				if err != nil {
+					return fmt.Errorf("couldn't create Drive v2 client: %s", err)
+				}
+				f.v2Svc = v2Svc
+			}
 		}
 	}
 
@@ -3298,63 +3303,51 @@ func (f *Fs) changeServiceAccountFile(ctx context.Context, file string) (err err
 			f.opt.ServiceAccountCredentials = oldCredentials
 		}
 	}()
-	f.opt.ServiceAccountFile = file
-	f.opt.ServiceAccountCredentials = ""
-	oAuthClient, err := createOAuthClient(ctx, &f.opt, f.name, f.m)
-	if err != nil {
-		return fmt.Errorf("drive: failed when making oauth client: %w", err)
-	}
-	f.client = oAuthClient
-	f.svc, err = drive.NewService(context.Background(), option.WithHTTPClient(f.client))
-	if err != nil {
-		return fmt.Errorf("couldn't create Drive client: %w", err)
-	}
-	if f.opt.V2DownloadMinSize >= 0 {
-		f.v2Svc, err = drive_v2.NewService(context.Background(), option.WithHTTPClient(f.client))
-		if err != nil {
-			return fmt.Errorf("couldn't create Drive v2 client: %w", err)
-		}
-	}
-	return nil
-}
 
-func (f *Fs) changeAccountFile(ctx context.Context, file string) (err error) {
-	fs.Debugf(nil, "Changing Account Token File from %s to %s", f.opt.ServiceAccountFile, file)
-	if file == f.opt.ServiceAccountFile {
-		return nil
-	}
-	oldSvc := f.svc
-	oldv2Svc := f.v2Svc
-	oldOAuthClient := f.client
-	oldFile := f.opt.ServiceAccountFile
-	oldCredentials := f.opt.ServiceAccountCredentials
-	defer func() {
-		// Undo all the changes instead of doing selective undo's
-		if err != nil {
-			f.svc = oldSvc
-			f.v2Svc = oldv2Svc
-			f.client = oldOAuthClient
-			f.opt.ServiceAccountFile = oldFile
-			f.opt.ServiceAccountCredentials = oldCredentials
-		}
-	}()
-	f.opt.ServiceAccountFile = file
 	f.opt.ServiceAccountCredentials = ""
+
+	if f.opt.UseAccount {
+		tokenFile := env.ShellExpand(file)
+		tokenData, err := os.ReadFile(tokenFile)
+
+		var token oauth2.Token
+		err = json.Unmarshal(tokenData, &token)
+		if err != nil {
+			return err
+		}
+		tokenBytes, err := json.Marshal(token)
+		if err != nil {
+			return err
+		}
+		tokenString := string(tokenBytes)
+		f.m.Set(config.ConfigToken, tokenString)
+
+		fs.Debugf(nil, "Using account token in config file %s", tokenString)
+
+		f.opt.ServiceAccountFile = ""
+	} else {
+		f.opt.ServiceAccountFile = file
+	}
+
 	oAuthClient, err := createOAuthClient(ctx, &f.opt, f.name, f.m)
 	if err != nil {
 		return fmt.Errorf("drive: failed when making oauth client: %w", err)
 	}
 	f.client = oAuthClient
-	f.svc, err = drive.NewService(context.Background(), option.WithHTTPClient(f.client))
-	if err != nil {
-		return fmt.Errorf("couldn't create Drive client: %w", err)
-	}
-	if f.opt.V2DownloadMinSize >= 0 {
-		f.v2Svc, err = drive_v2.NewService(context.Background(), option.WithHTTPClient(f.client))
+
+	if !f.opt.UseAccount {
+		f.svc, err = drive.NewService(context.Background(), option.WithHTTPClient(f.client))
 		if err != nil {
-			return fmt.Errorf("couldn't create Drive v2 client: %w", err)
+			return fmt.Errorf("couldn't create Drive client: %w", err)
+		}
+		if f.opt.V2DownloadMinSize >= 0 {
+			f.v2Svc, err = drive_v2.NewService(context.Background(), option.WithHTTPClient(f.client))
+			if err != nil {
+				return fmt.Errorf("couldn't create Drive v2 client: %w", err)
+			}
 		}
 	}
+
 	return nil
 }
 
