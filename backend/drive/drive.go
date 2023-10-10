@@ -1278,6 +1278,13 @@ func getClient(ctx context.Context, opt *Options) *http.Client {
 	}
 }
 
+// ----------------------------------------------------------------
+type credentialSubject struct {
+	Subject string `json:"subject"`
+}
+
+// ----------------------------------------------------------------
+
 func getServiceAccountClient(ctx context.Context, opt *Options, credentialsData []byte) (*http.Client, error) {
 	scopes := driveScopes(opt.Scope)
 	conf, err := google.JWTConfigFromJSON(credentialsData, scopes...)
@@ -1287,6 +1294,19 @@ func getServiceAccountClient(ctx context.Context, opt *Options, credentialsData 
 	if opt.Impersonate != "" {
 		conf.Subject = opt.Impersonate
 	}
+
+	// ----------------------------------------------------------------
+	// 支持切换subject
+	var f credentialSubject
+	if err := json.Unmarshal(credentialsData, &f); err != nil {
+		return nil, err
+	}
+
+	if f.Subject != "" {
+		conf.Subject = f.Subject
+	}
+	// ----------------------------------------------------------------
+
 	ctxWithSpecialClient := oauthutil.Context(ctx, getClient(ctx, opt))
 	return oauth2.NewClient(ctxWithSpecialClient, conf.TokenSource(ctxWithSpecialClient)), nil
 }
