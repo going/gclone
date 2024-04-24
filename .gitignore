@@ -16,3 +16,4 @@ vendor/
 .idea
 credentials
 .DS_Store
+gclone.linux.*
